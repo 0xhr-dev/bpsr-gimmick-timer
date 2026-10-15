@@ -1,0 +1,4 @@
+# Build / screenshot tools only. The timer itself runs on the standard library.
+# (Keep this file ASCII: pip reads it with the locale encoding, cp932 on JP Windows.)
+pyinstaller==6.22.3
+pillow==12.3.0

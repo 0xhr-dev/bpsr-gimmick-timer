@@ -1,0 +1,15 @@
+# 実行時にできるもの (窓の位置など PC ごとに違う値が入る)
+config.json
+config.json.tmp
+*.log
+
+# ビルド (exe はリポジトリに入れず、GitHub のリリースに置く)
+.venv/
+build/
+dist/
+*.exe
+*.spec
+
+# Python
+__pycache__/
+*.pyc

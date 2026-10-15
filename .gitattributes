@@ -1,0 +1,2 @@
+# cmd.exe は LF 改行のバッチでラベル (goto) を取りこぼすことがあるので CRLF に固定する
+*.bat text eol=crlf
