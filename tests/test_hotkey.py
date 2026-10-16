@@ -4,8 +4,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from hotkey import (CAPTURE_VKS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, KeyCapture,  # noqa: E402
-                    label, name_for_vk, parse_hotkey, same_hotkey)
+from hotkey import (CAPTURE_VKS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, HotkeyPoller,  # noqa: E402
+                    KeyCapture, label, name_for_vk, parse_hotkey, same_hotkey)
 
 
 class ParseTest(unittest.TestCase):
@@ -89,6 +89,51 @@ class KeyCaptureTest(unittest.TestCase):
         self.start()
         self.down.add(0x1B)
         self.assertEqual(self.capture.poll(), ("cancel", None))
+
+
+class HotkeyPollerTest(unittest.TestCase):
+    BINDINGS = {"start": "F9", "repeat": "F10", "stop": "ctrl+F9"}
+
+    def setUp(self):
+        self.down = set()
+
+    def make(self):
+        return HotkeyPoller(self.BINDINGS, out_queue=None, is_down=lambda vk: vk in self.down)
+
+    def test_fires_once_per_press(self):
+        p = self.make()
+        self.assertEqual(p.poll(), [])
+        self.down.add(0x78)                       # F9 を押す
+        self.assertEqual(p.poll(), ["start"])
+        self.assertEqual(p.poll(), [])            # 押しっぱなしでは連打にならない
+        self.down.discard(0x78)
+        self.assertEqual(p.poll(), [])
+        self.down.add(0x78)
+        self.assertEqual(p.poll(), ["start"])
+
+    def test_modifiers_must_match_exactly(self):
+        p = self.make()
+        self.down.update({0x11, 0x78})            # Ctrl+F9
+        self.assertEqual(p.poll(), ["stop"])      # F9 単体 (start) は動かない
+        self.down.clear()
+        p.poll()
+        self.down.update({0x10, 0x79})            # Shift+F10 は割り当てていない
+        self.assertEqual(p.poll(), [])
+
+    def test_key_held_at_start_is_ignored(self):
+        self.down.add(0x79)
+        p = self.make()
+        self.assertEqual(p.poll(), [])
+        self.down.discard(0x79)
+        p.poll()
+        self.down.add(0x79)
+        self.assertEqual(p.poll(), ["repeat"])
+
+    def test_bad_binding_is_reported(self):
+        p = HotkeyPoller({"start": "F99", "stop": "F11"}, out_queue=None,
+                         is_down=lambda vk: False)
+        self.assertEqual(len(p.failures), 1)
+        self.assertEqual([a for a, _m, _vk in p._keys], ["stop"])
 
 
 if __name__ == "__main__":

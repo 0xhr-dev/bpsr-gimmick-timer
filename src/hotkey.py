@@ -1,32 +1,30 @@
-"""グローバルホットキー (Win32 RegisterHotKey) と、設定画面でのキーの読み取り。
+"""ホットキーの検出と、設定画面でのキーの読み取り。
 
-ゲームが前面にあっても押したキーを受け取るために使う。
-pynput / keyboard のようなフック方式はゲーム上で取りこぼすことがあるので
-使わない。RegisterHotKey は OS が直接 WM_HOTKEY を届けるので、フックが
-外されることも無い。
+どちらも GetAsyncKeyState でキーの状態を直接読む (専用スレッドで 15ms ごと)。
+タイマーの窓はフォーカスを取らない (取るとゲームの操作が止まる) ので、
+キー入力のイベントは窓に届かないため。
 
-登録したキーはゲームには届かなくなる (OS が先に取る)。ゲームで使うキーは
-割り当てないこと。
+★ ゲームより低い権限では動かない
+  ゲームは管理者権限で動いている。Windows の UIPI により、管理者権限の窓が
+  前面にある間は、一般権限のプロセスからはキーの状態が読めない
+  (RegisterHotKey のホットキーも届かない)。exe は管理者権限で起動する
+  (build.bat の --uac-admin)。is_admin() が False のときはタイマーに警告を出す。
 
-RegisterHotKey は「登録したスレッドのメッセージキュー」に WM_HOTKEY を積むので、
-専用スレッドで登録して GetMessageW を回す。届いた操作名は queue に積むだけで、
-Tk には一切触らない (Tk はメインスレッドからしか触れない)。
+キーはゲームにもそのまま届く (横取りしない)。ゲームで使うキーは割り当てないこと。
+押されたことが分かったら操作名を queue に積むだけで、Tk には一切触らない
+(Tk はメインスレッドからしか触れない)。
 """
 
 import ctypes
 import sys
 import threading
-from ctypes import wintypes
 
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
-MOD_NOREPEAT = 0x4000      # 押しっぱなしで連打扱いにしない
 
-WM_HOTKEY = 0x0312
-WM_QUIT = 0x0012
-PM_NOREMOVE = 0x0000
+POLL_SEC = 0.015
 
 _MODIFIERS = {
     "ctrl": MOD_CONTROL,
@@ -147,6 +145,31 @@ def _async_down(vk):
     return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
 
 
+def current_mods(is_down):
+    """いま押されている修飾キー (MOD_* の組み合わせ)。"""
+    mods = 0
+    if is_down(_VK_CTRL):
+        mods |= MOD_CONTROL
+    if is_down(_VK_ALT):
+        mods |= MOD_ALT
+    if is_down(_VK_SHIFT):
+        mods |= MOD_SHIFT
+    if is_down(_VK_LWIN) or is_down(_VK_RWIN):
+        mods |= MOD_WIN
+    return mods
+
+
+def is_admin():
+    """管理者権限で動いているか。ゲームが管理者権限なので、これが False だと
+    ゲームを操作している間はキーが読めない。"""
+    if not _IS_WIN:
+        return True
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
 class KeyCapture:
     """次に押されたキーをホットキー文字列にする (設定画面の「キーを押してください」)。
 
@@ -170,73 +193,67 @@ class KeyCapture:
                 continue
             if vk == VK_ESCAPE:
                 return ("cancel", None)
-            mods = [name for name, mvk in (("ctrl", _VK_CTRL), ("alt", _VK_ALT),
-                                           ("shift", _VK_SHIFT)) if self._is_down(mvk)]
-            if self._is_down(_VK_LWIN) or self._is_down(_VK_RWIN):
-                mods.append("win")
-            return ("key", "+".join(mods + [name_for_vk(vk)]))
+            mods = current_mods(self._is_down)
+            names = [name for bit, name in ((MOD_CONTROL, "ctrl"), (MOD_ALT, "alt"),
+                                            (MOD_SHIFT, "shift"), (MOD_WIN, "win"))
+                     if mods & bit]
+            return ("key", "+".join(names + [name_for_vk(vk)]))
         return None
 
 
-class HotkeyListener:
-    """専用スレッドでホットキーを登録し、押された操作名を queue に積む。
+class HotkeyPoller:
+    """設定したキーが押されたら、操作名を queue に積む。
 
-    bindings: {操作名: ホットキー文字列}。例 {"start": "F9", "stop": "F10"}
-    start() は登録が終わるまで待ってから戻るので、直後に failures を見てよい。
+    bindings: {操作名: ホットキー文字列}。例 {"start": "F9", "stop": "F11"}
+    専用スレッドで POLL_SEC ごとにキーの状態を読み、離れている → 押された、に
+    変わった瞬間だけ数える (押しっぱなしで連打にならない)。修飾キーは完全一致で
+    見るので、F9 と Ctrl+F9 は別の操作に割り当てられる。
+
+    Tk のイベントループとは別のスレッドで読むので、画面の描き直しで Tk が
+    止まっている間に押されても取りこぼさない。
     """
 
-    def __init__(self, bindings, out_queue):
-        self._bindings = list(bindings.items())
+    def __init__(self, bindings, out_queue, is_down=None):
         self._out = out_queue
-        self._thread = None
-        self._thread_id = None
-        self._ready = threading.Event()
-        self.failures = []          # 登録できなかったキーの説明 (日本語)
-
-    def start(self):
-        if not _IS_WIN:
-            self.failures.append("ホットキーは Windows でしか使えません")
-            return
-        self._thread = threading.Thread(target=self._run, name="hotkey", daemon=True)
-        self._thread.start()
-        self._ready.wait(timeout=2.0)
-
-    def stop(self):
-        if self._thread is None:
-            return
-        if self._thread_id is not None:
-            ctypes.windll.user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
-        self._thread.join(timeout=2.0)
-        self._thread = None
-
-    def _run(self):
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        self._thread_id = kernel32.GetCurrentThreadId()
-
-        actions = {}
-        for hotkey_id, (action, text) in enumerate(self._bindings, start=1):
+        self._is_down = is_down or _async_down
+        self._keys = []             # (操作名, 修飾キー, 仮想キーコード)
+        self.failures = []          # 読めなかった設定の説明 (日本語)
+        for action, text in bindings.items():
             try:
                 mods, vk = parse_hotkey(text)
             except ValueError as e:
                 self.failures.append(str(e))
                 continue
-            if user32.RegisterHotKey(None, hotkey_id, mods | MOD_NOREPEAT, vk):
-                actions[hotkey_id] = action
-            else:
-                self.failures.append(
-                    f"{label(text)} を登録できません (他のアプリが使用中の可能性)")
+            self._keys.append((action, mods, vk))
+        # 始めた時点で押しっぱなしのキーは、一度離されるまで数えない
+        self._prev = {vk: self._is_down(vk) for _a, _m, vk in self._keys}
+        self._stop = threading.Event()
+        self._thread = None
 
-        msg = wintypes.MSG()
-        # PostThreadMessageW はキューが出来ていないスレッドには届かない。
-        # stop() が間に合わず空振りしないよう、ready を立てる前にキューを作らせる。
-        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_NOREMOVE)
-        self._ready.set()
+    def poll(self):
+        """1 回分調べて、押された操作名のリストを返す。"""
+        down = {vk: self._is_down(vk) for vk in self._prev}
+        mods = current_mods(self._is_down)
+        fired = [action for action, want, vk in self._keys
+                 if down[vk] and not self._prev[vk] and mods == want]
+        self._prev = down
+        return fired
 
-        try:
-            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-                if msg.message == WM_HOTKEY and msg.wParam in actions:
-                    self._out.put(actions[msg.wParam])
-        finally:
-            for hotkey_id in actions:
-                user32.UnregisterHotKey(None, hotkey_id)
+    def start(self):
+        if not _IS_WIN:
+            self.failures.append("キーの検出は Windows でしか使えません")
+            return
+        self._thread = threading.Thread(target=self._run, name="hotkey", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _run(self):
+        while not self._stop.wait(POLL_SEC):
+            for action in self.poll():
+                self._out.put(action)

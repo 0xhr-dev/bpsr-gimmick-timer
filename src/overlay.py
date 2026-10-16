@@ -3,7 +3,8 @@
 プレイ中はゲームが前面にあるので、次の 3 つを満たす必要がある。
   1. 常に最前面 (-topmost に加え、2 秒ごとに SetWindowPos で押し戻す)
   2. クリックしてもゲームからフォーカスを奪わない (WS_EX_NOACTIVATE)
-  3. ゲームが前面のままでも操作できる (グローバルホットキー。hotkey.py)
+  3. ゲームが前面のままでも操作できる (キーの状態を直接読む。hotkey.py)
+     ゲームは管理者権限で動くので、タイマーも管理者権限で動かす必要がある
 
 録画やスクリーンショットにはそのまま写る (WDA_EXCLUDEFROMCAPTURE は付けない)。
 
@@ -37,7 +38,7 @@ from tkinter import messagebox
 import schedule
 import theme
 from config import Config, app_dir
-from hotkey import HotkeyListener, label as hotkey_label
+from hotkey import HotkeyPoller, is_admin, label as hotkey_label
 from settings_panel import SettingsPanel
 
 # --- Win32 -------------------------------------------------------------
@@ -101,6 +102,7 @@ class TimerApp:
     def __init__(self, config_path=None, clock=time.monotonic, hotkeys=True):
         self._clock = clock
         self._use_hotkeys = hotkeys
+        self._admin = is_admin()
         self.config = Config(config_path).load()
         self.started_at = None
         self.skip_first = False                 # True なら初回を飛ばして間隔だけで数える
@@ -410,9 +412,13 @@ class TimerApp:
 
     def _render_note(self):
         lines = list(self.config.warnings) + list(self._hotkey_failures)
+        if self._use_hotkeys and not self._admin:
+            # ゲームが管理者権限なので、一般権限ではゲーム操作中のキーが読めない
+            lines.insert(0, "管理者権限でないため、ゲーム中はキーが効きません")
         if self._error:
             lines.append(self._error)
-        text = "\n".join(f"⚠ {line}" for line in lines)
+        # 「⚠」の後に空白を入れない。Tk は空白で折り返すので、記号だけの行ができる
+        text = "\n".join(f"⚠{line}" for line in lines)
         visible = bool(text)
         if visible:
             self._set(self._note, text)
@@ -452,7 +458,7 @@ class TimerApp:
         self._hotkey_failures = []
         if not self._use_hotkeys or self._hotkeys_paused:
             return
-        self._listener = HotkeyListener(
+        self._listener = HotkeyPoller(
             {action: self.config[key] for key, action in ACTIONS.items()}, self._actions)
         self._listener.start()
         self._hotkey_failures = list(self._listener.failures)

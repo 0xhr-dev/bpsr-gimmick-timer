@@ -11,9 +11,11 @@ if not exist ".venv\Scripts\python.exe" (
 )
 ".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -q -r requirements-build.txt || goto :error
 
+rem --uac-admin: ゲームが管理者権限で動くので、タイマーも管理者権限で起動させる
+rem (一般権限だとゲーム操作中のキーが読めない)。起動時に UAC の確認が出る。
 rem --specpath build にすると相対パスは build\ 基準で解釈されるので、
 rem アイコンとソースのパスは絶対パスで渡す。
-".venv\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed ^
+".venv\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed --uac-admin ^
     --name BPSRGimmickTimer ^
     --icon "%~dp0assets\icon.ico" ^
     --paths "%~dp0src" ^
